@@ -1,0 +1,1825 @@
+"""
+================================================================================
+QUANTUM HEDGE | Real-Time Options Cross-Greek Exposure Monitor
+================================================================================
+Purpose:
+    A live, institutional-grade dashboard that visualizes dealer Gamma (GEX),
+    Vanna (VEX), and Charm (CEX) exposure across the options chain.
+    Understanding WHERE market makers are concentrated tells you where price
+    will be ATTRACTED (pinned) or REPELLED (cascading trend).
+
+Architecture - Three Decoupled Layers:
+    1. DATA PIPELINE LAYER  -- Swappable provider classes (Schwab, Yahoo, Sim)
+       Each provider returns a standardized DataFrame. The math engine never
+       cares which source supplied the data -- total API independence.
+
+    2. MATHEMATICAL ENGINE  -- Pure Black-Scholes Greeks (no API dependencies)
+       OptionsMarketSimulator computes Delta, Gamma, Vanna, Charm, and all
+       exposure metrics using fully vectorized NumPy operations.
+
+    3. PRESENTATION LAYER   -- Plotly Dash interactive dashboard
+       Reactive callback system re-renders charts and metrics on every tick.
+
+Key Concepts:
+    GEX (Gamma Exposure):
+        How many dollars market makers must buy/sell per 1% spot move to stay
+        delta-neutral. Positive GEX = dealers BUY dips, SELL rallies (pin).
+        Negative GEX = dealers CHASE momentum (volatility amplification).
+
+    VEX (Vanna Exposure):
+        How much dealer delta changes per 1% absolute shift in implied vol.
+        Critical during vol crush events (e.g., post-earnings IV collapse).
+
+    CEX (Charm Exposure):
+        Passive daily delta decay -- how much dealer hedges "bleed" as time
+        passes. Important heading into weekly or monthly expirations.
+
+    Gamma Flip Level:
+        The exact price where NET GEX crosses zero. Above = Long Gamma regime
+        (mean-reverting). Below = Short Gamma regime (trend-following, volatile).
+================================================================================
+"""
+
+# ==============================================================================
+# STANDARD LIBRARY IMPORTS
+# ==============================================================================
+import os          # File path operations (checking if schwab_tokens.json exists)
+import sys         # System-level access (retained for compatibility)
+import time        # Unix timestamp for OAuth token expiration checks
+import json        # Reading and writing the credential/token JSON file
+import base64      # Base64-encoding credentials for the Schwab OAuth Basic Auth header
+import requests    # HTTP client for all REST API calls to the Schwab endpoints
+
+# ==============================================================================
+# THIRD-PARTY DATA AND MATH IMPORTS
+# ==============================================================================
+import numpy as np              # Vectorized math arrays -- backbone of all Black-Scholes calculations
+import pandas as pd             # DataFrames for storing and transforming options chains
+import yfinance as yf           # Yahoo Finance fallback data provider (free, no auth needed)
+from datetime import datetime   # Used to compute days-to-expiration from ISO date strings
+import scipy.stats as si        # Kept for compatibility; ndtr used directly for performance
+from scipy.special import ndtr  # Compiled C-level CDF -- ~5x faster than scipy.stats.norm.cdf
+from scipy.interpolate import UnivariateSpline
+from scipy.optimize import brentq
+import urllib.parse             # URL encoding for building the OAuth authorization link
+
+# ==============================================================================
+# VISUALIZATION AND DASHBOARD IMPORTS
+# ==============================================================================
+import plotly.graph_objects as go          # Core Plotly chart types: Bar, Scatter, Heatmap
+from plotly.subplots import make_subplots  # Multi-panel subplot layout builder
+
+import dash                                    # Core Dash web application framework
+from dash import dcc, html, Input, Output, State  # Layout components + reactive callback types
+import dash_bootstrap_components as dbc        # Bootstrap-styled UI components (Cards, Rows, Buttons)
+
+# ==============================================================================
+# SECTION 1: SCHWAB OAUTH 2.0 AND LIVE API CLIENT LAYER
+# ==============================================================================
+# Charles Schwab uses a standard OAuth 2.0 Authorization Code Grant flow.
+# The full sequence (one-time setup per refresh token):
+#
+#   STEP 1: User enters App Key + Secret in the dashboard and clicks "Save Keys"
+#   STEP 2: User clicks "Generate Auth Link" -- Schwab login page opens in browser
+#   STEP 3: User logs into Schwab and clicks "Approve" to authorize the app
+#   STEP 4: Schwab redirects the browser to: https://127.0.0.1/?code=XXXX...
+#   STEP 5: User copies that full URL and pastes it into the dashboard
+#   STEP 6: We POST the code to /token and receive access_token + refresh_token
+#   STEP 7: Every 30 min the access_token is auto-refreshed using refresh_token
+#
+# SECURITY: Real credentials go in schwab_tokens.json (gitignored).
+#           NEVER commit real API keys to a public repository.
+# ==============================================================================
+
+# Path to the local JSON file that persists tokens between app sessions
+TOKEN_FILE = "schwab_tokens.json"
+
+def load_schwab_tokens():
+    """
+    Load OAuth tokens and credentials from the local JSON file.
+
+    If the file does not exist yet, returns a safe default dict with DUMMY
+    placeholder strings so the app runs without crashing. The merge loop
+    ensures any new keys added in future versions are always present even
+    if the saved file is from an older version.
+    """
+    default_tokens = {
+        "app_key": "DUMMY_SCHWAB_APP_KEY",
+        "app_secret": "DUMMY_SCHWAB_APP_SECRET",
+        "redirect_uri": "https://127.0.0.1",
+        "access_token": "",
+        "refresh_token": "",
+        "expires_at": 0,
+        "refresh_expires_at": 0
+    }
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE, "r") as f:
+                data = json.load(f)
+                # Merge with default_tokens to ensure all keys exist
+                for k, v in default_tokens.items():
+                    if k not in data:
+                        data[k] = v
+                return data
+        except Exception:
+            return default_tokens
+    return default_tokens
+
+def save_schwab_tokens(tokens):
+    """
+    Persist the full token/credential dictionary to schwab_tokens.json.
+    Uses indent=4 for human-readable formatting in case you need to inspect it.
+    Returns True on success, False if the write fails (e.g., permissions issue).
+    """
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            json.dump(tokens, f, indent=4)
+        return True
+    except Exception:
+        return False
+
+def exchange_schwab_auth_code(code, tokens):
+    """
+    OAuth Token Exchange: Swap a one-time authorization code for long-lived tokens.
+
+    Schwab's token endpoint uses HTTP Basic Auth where the Authorization header
+    contains "Basic " + base64(AppKey + ":" + AppSecret).
+
+    The 'code' argument can be EITHER:
+      - The raw code string (e.g. "C0abc123...")
+      - The full redirect URL pasted from the browser address bar
+    Both cases are handled -- we parse the URL and extract the ?code= param if
+    a "code=" substring is detected in the input.
+    """
+    app_key = tokens.get("app_key")
+    app_secret = tokens.get("app_secret")
+    redirect_uri = tokens.get("redirect_uri")
+    
+    if not app_key or not app_secret or "DUMMY" in app_key or "DUMMY" in app_secret:
+        return False, "Invalid App Key or App Secret"
+        
+    url = "https://api.schwabapi.com/v1/oauth/token"
+    
+    # Base64 encode app_key:app_secret
+    credentials = f"{app_key}:{app_secret}"
+    encoded_creds = base64.b64encode(credentials.encode()).decode()
+    
+    headers = {
+        "Authorization": f"Basic {encoded_creds}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    
+    # If the code was pasted as a full URL, parse it
+    if "code=" in code:
+        try:
+            parsed = urllib.parse.urlparse(code)
+            params = urllib.parse.parse_qs(parsed.query)
+            code = params.get("code", [code])[0]
+        except Exception:
+            pass
+            
+    payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, data=payload, timeout=10)
+        if response.status_code == 200:
+            res_data = response.json()
+            tokens["access_token"] = res_data.get("access_token")
+            tokens["refresh_token"] = res_data.get("refresh_token")
+            tokens["expires_at"] = time.time() + float(res_data.get("expires_in", 1800))
+            tokens["refresh_expires_at"] = time.time() + float(res_data.get("refresh_token_expires_in", 604800))
+            save_schwab_tokens(tokens)
+            return True, "Successfully connected to Schwab Live Data!"
+        else:
+            return False, f"Failed: {response.status_code} - {response.text}"
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def refresh_schwab_access_token(tokens):
+    """
+    Silently re-issue a new access_token using the stored refresh_token.
+
+    Called automatically on every dashboard tick when the current access_token
+    is within 60 seconds of its expiry (expires_at - 60). This prevents
+    mid-session disconnects during live trading hours.
+
+    Schwab sometimes rotates the refresh_token itself -- if the response
+    includes a new refresh_token we save it immediately so the session
+    can continue for another 7 days without requiring a full re-authorization.
+
+    Returns: (True, success_message) or (False, error_string)
+    """
+    app_key = tokens.get("app_key")
+    app_secret = tokens.get("app_secret")
+    refresh_token = tokens.get("refresh_token")
+    
+    if not app_key or not app_secret or not refresh_token:
+        return False, "Missing credentials or refresh token"
+        
+    url = "https://api.schwabapi.com/v1/oauth/token"
+    credentials = f"{app_key}:{app_secret}"
+    encoded_creds = base64.b64encode(credentials.encode()).decode()
+    
+    headers = {
+        "Authorization": f"Basic {encoded_creds}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, data=payload, timeout=10)
+        if response.status_code == 200:
+            res_data = response.json()
+            tokens["access_token"] = res_data.get("access_token")
+            if res_data.get("refresh_token"):
+                tokens["refresh_token"] = res_data.get("refresh_token")
+            tokens["expires_at"] = time.time() + float(res_data.get("expires_in", 1800))
+            save_schwab_tokens(tokens)
+            return True, "Token refreshed successfully"
+        else:
+            return False, f"Failed to refresh: {response.status_code} - {response.text}"
+    except Exception as e:
+        return False, f"Refresh error: {str(e)}"
+
+def fetch_schwab_quotes(symbols, access_token):
+    """
+    Fetch a real-time Level 1 quote from Schwab's Market Data API.
+
+    Important symbol formatting rules:
+      - Index symbols (SPX, NDX) MUST be prefixed with $: "$SPX", "$NDX"
+      - Equity symbols (AAPL, NVDA) are passed as-is
+    We handle this mapping in map_symbol_to_schwab() before calling here.
+
+    The 'fields=quote' parameter requests only the quote data object, which
+    contains lastPrice, closePrice, and other Level 1 tick fields.
+
+    Returns: parsed JSON dict on success, None on any HTTP or network error.
+    """
+    url = "https://api.schwabapi.com/marketdata/v1/quotes"
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+    params = {
+        "symbols": symbols,
+        "fields": "quote"
+    }
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return None
+    except Exception:
+        return None
+
+def fetch_schwab_chains(symbol, access_token):
+    """
+    Fetch the complete options chain for a symbol from Schwab's /chains endpoint.
+
+    The response format is a nested dictionary:
+        callExpDateMap -> { "YYYY-MM-DD:DTE" -> { "strikePrice" -> [contractData] } }
+        putExpDateMap  -> (same structure for puts)
+
+    Key parameters used:
+      - contractType=ALL  : Returns both calls and puts in a single request
+      - includeUnderlyingQuote=true : Embeds the current spot price in the response
+
+    The SchwabProvider class is responsible for flattening this nested structure
+    into the standardized flat DataFrame the math engine expects.
+
+    Returns: parsed JSON dict on success, None on any HTTP or network error.
+    """
+    url = "https://api.schwabapi.com/marketdata/v1/chains"
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+    params = {
+        "symbol": symbol,
+        "contractType": "ALL",
+        "includeUnderlyingQuote": "true"
+    }
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return None
+    except Exception:
+        return None
+
+# ==============================================================================
+# SECTION 2: DECOUPLED DATA PIPELINE PROVIDERS (STRATEGY PATTERN)
+# ==============================================================================
+# The key architectural insight of this program:
+#   The mathematical engine should NEVER know where the data came from.
+#   Whether it is Schwab live data, Yahoo Finance, or a Monte Carlo simulation,
+#   the math always receives the exact same standardized DataFrame format.
+#
+# This is the SOFTWARE ENGINEERING concept of "Dependency Inversion" --
+# high-level modules (math engine, dashboard) don't depend on low-level details
+# (specific APIs), they both depend on a shared abstraction (DataProvider).
+#
+# FALLBACK CASCADE ORDER (tried in sequence until one succeeds):
+#   Priority 1: SchwabProvider    -- Real-time authenticated brokerage data
+#   Priority 2: YFinanceProvider  -- Free Yahoo Finance data (no auth needed)
+#   Priority 3: SimulatedProvider -- Local Monte Carlo synthetic data (offline)
+#
+# TO ADD A NEW DATA SOURCE (e.g., IBKR, TastyTrade, Polygon.io):
+#   1. Create a class inheriting from DataProvider
+#   2. Implement fetch_data() to return (spot_float, chain_df, source_name_str)
+#   3. Return (None, None, None) to indicate failure and trigger cascade
+#   4. Add an instance to the DataPipelineManager providers list in the callback
+# ==============================================================================
+
+def safe_float(val, default=0.0):
+    """Safely cast a value to float, handling NaNs and None without throwing an exception."""
+    try:
+        return float(val) if pd.notna(val) else default
+    except (ValueError, TypeError):
+        return default
+
+def safe_int(val, default=0):
+    """Safely cast a value to int, handling NaNs and None without throwing an exception."""
+    try:
+        return int(float(val)) if pd.notna(val) else default
+    except (ValueError, TypeError):
+        return default
+
+# Global cache for risk-free rate to avoid hammering the API
+GLOBAL_RATE_CACHE = {"rate": 0.045, "last_fetch": 0}
+
+def get_live_risk_free_rate():
+    global GLOBAL_RATE_CACHE
+    import time
+    if time.time() - GLOBAL_RATE_CACHE["last_fetch"] > 3600:
+        try:
+            import yfinance as yf
+            irx = yf.Ticker("^IRX")
+            hist = irx.history(period="1d")
+            if not hist.empty:
+                GLOBAL_RATE_CACHE["rate"] = float(hist["Close"].iloc[-1]) / 100.0
+                GLOBAL_RATE_CACHE["last_fetch"] = time.time()
+        except Exception:
+            pass
+    return GLOBAL_RATE_CACHE["rate"]
+
+class DataProvider:
+    """
+    Abstract base interface that all data providers must implement.
+    Defines the contract: accept a ticker + params, return standardized data.
+
+    Return signature: (spot_price: float, chain_df: pd.DataFrame, source_name: str)
+    On failure, return: (None, None, None) to signal cascade to next provider.
+    """
+
+class SchwabProvider(DataProvider):
+    def fetch_data(self, ticker, current_spot, vol, tokens=None, **kwargs):
+        if not tokens or not tokens.get("access_token") or not tokens.get("refresh_token"):
+            return None, None, None
+            
+        if time.time() > tokens.get("expires_at", 0):
+            return None, None, None
+            
+        schwab_symbol = map_symbol_to_schwab(ticker)
+        quotes = fetch_schwab_quotes(schwab_symbol, tokens["access_token"])
+        spot_schwab = current_spot
+        if quotes and schwab_symbol in quotes:
+            try:
+                quote_data = quotes[schwab_symbol]["quote"]
+                spot_schwab = float(quote_data.get("lastPrice", current_spot))
+                if spot_schwab == 0:
+                    spot_schwab = float(quote_data.get("closePrice", current_spot))
+            except Exception:
+                pass
+                
+        schwab_chain = fetch_schwab_chains(schwab_symbol, tokens["access_token"])
+        if not schwab_chain:
+            return None, None, None
+            
+        try:
+            records = []
+            call_map = schwab_chain.get("callExpDateMap", {})
+            put_map = schwab_chain.get("putExpDateMap", {})
+            
+            for exp_key, strikes_dict in call_map.items():
+                parts = exp_key.split(':')
+                days_to_expiration = int(parts[1]) if len(parts) > 1 else 0
+                dte = days_to_expiration / 365.0
+                exp_label = "0DTE" if days_to_expiration <= 1 else "1-Week" if days_to_expiration <= 8 else "1-Month" if days_to_expiration <= 35 else "3-Month"
+                for strike_str, contracts in strikes_dict.items():
+                    for contract in contracts:
+                        iv = safe_float(contract.get("volatility", vol), vol)
+                        if iv > 2.0: iv /= 100.0
+                        elif iv <= 0 or np.isnan(iv): iv = vol
+                        strike_val = safe_float(contract.get("strikePrice", strike_str))
+                        oi_val = safe_int(contract.get("openInterest", 0))
+                        records.append({"Expiration": exp_label, "Strike": strike_val, "Type": "Call", "IV": iv, "OI": oi_val, "DTE": dte})
+            
+            for exp_key, strikes_dict in put_map.items():
+                parts = exp_key.split(':')
+                days_to_expiration = int(parts[1]) if len(parts) > 1 else 0
+                dte = days_to_expiration / 365.0
+                exp_label = "0DTE" if days_to_expiration <= 1 else "1-Week" if days_to_expiration <= 8 else "1-Month" if days_to_expiration <= 35 else "3-Month"
+                for strike_str, contracts in strikes_dict.items():
+                    for contract in contracts:
+                        iv = safe_float(contract.get("volatility", vol), vol)
+                        if iv > 2.0: iv /= 100.0
+                        elif iv <= 0 or np.isnan(iv): iv = vol
+                        strike_val = safe_float(contract.get("strikePrice", strike_str))
+                        oi_val = safe_int(contract.get("openInterest", 0))
+                        records.append({"Expiration": exp_label, "Strike": strike_val, "Type": "Put", "IV": iv, "OI": oi_val, "DTE": dte})
+                        
+            if not records:
+                return None, None, None
+            return spot_schwab, pd.DataFrame(records), "LIVE SCHWAB DATA"
+        except Exception:
+            return None, None, None
+
+class YFinanceProvider(DataProvider):
+    """
+    Secondary fallback provider using Yahoo Finance (via the yfinance library).
+    Free, publicly accessible, requires zero authentication.
+
+    Key implementation decisions:
+      - Index symbols need a ^ prefix for yfinance: SPX -> ^SPX, NDX -> ^NDX
+      - We only fetch the first 4 expiration dates to keep response time fast.
+        Fetching all 50+ expirations would take 10+ seconds per refresh cycle.
+      - Yahoo's impliedVolatility is already in decimal form (0.235 = 23.5%).
+        Unlike Schwab, no conversion needed.
+      - DTE is computed from the ISO date string returned by yfinance.
+      - We floor DTE at 0.5 days (not 0) to prevent division-by-zero in BS math
+        when an expiration date is today.
+      - If yfinance is unavailable (network error, rate limit), returns None
+        which cascades to the SimulatedProvider.
+    """
+    def fetch_data(self, ticker, current_spot, vol, **kwargs):
+        try:
+            yf_ticker = f"^{ticker}" if ticker in ["SPX", "NDX"] else ticker
+            tk = yf.Ticker(yf_ticker)
+            
+            spot = current_spot
+            try:
+                hist = tk.history(period="1d")
+                if not hist.empty:
+                    spot = float(hist["Close"].iloc[-1])
+            except Exception:
+                pass
+                
+            expirations = tk.options
+            if not expirations:
+                return None, None, None
+                
+            records = []
+            for exp_date in expirations[:4]:
+                chain = tk.option_chain(exp_date)
+                days = max((datetime.strptime(exp_date, "%Y-%m-%d") - datetime.now()).days, 0)
+                dte = max(days, 0.5) / 365.0
+                exp_label = "0DTE" if days <= 1 else "1-Week" if days <= 8 else "1-Month" if days <= 35 else "3-Month"
+                
+                for _, row in chain.calls.iterrows():
+                    iv = safe_float(row.get("impliedVolatility", vol), vol)
+                    if iv <= 0 or np.isnan(iv): iv = vol
+                    strike_val = safe_float(row.get("strike", 0))
+                    oi_val = safe_int(row.get("openInterest", 0))
+                    records.append({"Expiration": exp_label, "Strike": strike_val, "Type": "Call", "IV": iv, "OI": oi_val, "DTE": dte})
+                    
+                for _, row in chain.puts.iterrows():
+                    iv = safe_float(row.get("impliedVolatility", vol), vol)
+                    if iv <= 0 or np.isnan(iv): iv = vol
+                    strike_val = safe_float(row.get("strike", 0))
+                    oi_val = safe_int(row.get("openInterest", 0))
+                    records.append({"Expiration": exp_label, "Strike": strike_val, "Type": "Put", "IV": iv, "OI": oi_val, "DTE": dte})
+                    
+            if not records:
+                return None, None, None
+            return spot, pd.DataFrame(records), "YFINANCE DATA"
+        except Exception:
+            return None, None, None
+
+class SimulatedProvider(DataProvider):
+    """
+    Tertiary offline fallback -- generates a completely synthetic options chain.
+    No internet connection required. Works entirely with local math.
+
+    The micro-drift simulation adds small random-walk noise to the spot price
+    on each automatic system-tick to simulate live price movement. This gives
+    the dashboard a sense of liveness even with zero API connectivity.
+
+    The synthetic chain uses a realistic volatility smile/skew model and
+    clusters open interest at psychological round-number strike levels --
+    making the simulation visually believable and educationally meaningful.
+    """
+    def __init__(self, simulator, triggered_id):
+        self.simulator = simulator
+        self.triggered_id = triggered_id
+        
+    def fetch_data(self, ticker, current_spot, vol, **kwargs):
+        spot = current_spot
+        if self.triggered_id == "system-tick":
+            drift = 0.0001 * (np.random.rand() - 0.49) 
+            vol_impact = vol * 0.05 * np.random.randn()
+            spot = spot * (1.0 + drift + vol_impact)
+            
+        self.simulator.ticker = ticker
+        self.simulator.vol = vol
+        chain_df = self.simulator.generate_option_chain(spot)
+        return spot, chain_df, "SIMULATED DATA"
+
+class DataPipelineManager:
+    """
+    Orchestrates the priority cascade through all registered data providers.
+
+    Calls providers[0].fetch_data() first. If it returns a non-empty DataFrame,
+    that data is used and remaining providers are never called. If it returns
+    (None, None, None), falls through to providers[1], and so on.
+
+    If ALL providers fail (rare edge case), returns an empty DataFrame with
+    source_name "ERROR: NO DATA". The callback handles this gracefully by
+    displaying stale data rather than crashing the server.
+    """
+    def __init__(self, providers):
+        self.providers = providers
+        
+    def fetch_best_data(self, ticker, current_spot, vol, **kwargs):
+        for provider in self.providers:
+            spot, df, name = provider.fetch_data(ticker, current_spot, vol, **kwargs)
+            if df is not None and not df.empty:
+                return spot, df, name
+        return current_spot, pd.DataFrame(), "ERROR: NO DATA"
+
+# ==============================================================================
+# SECTION 3: MATHEMATICAL ENGINE AND VECTORIZED BLACK-SCHOLES SOLVER
+# ==============================================================================
+# This section is the CORE of the program. It is completely decoupled from
+# all external APIs and data sources -- it receives a plain DataFrame and
+# produces exposure metrics using analytical Black-Scholes formulas.
+#
+# Black-Scholes Quick Reference:
+#   d1 = [ln(S/K) + (r - q + 0.5*sigma^2)*T] / (sigma * sqrt(T))
+#   d2 = d1 - sigma * sqrt(T)
+#
+#   Delta(Call) = exp(-q*T) * N(d1)
+#   Delta(Put)  = -exp(-q*T) * N(-d1)
+#   Gamma       = exp(-q*T) * n(d1) / (S * sigma * sqrt(T))
+#   Vanna       = -exp(-q*T) * n(d1) * d2 / sigma
+#   Charm       = dividend*exp(-q*T)*N(d1) - exp(-q*T)*n(d1)*[...]
+#
+# Where: S=Spot, K=Strike, T=Time(years), r=Rate, q=Dividend, sigma=IV
+#        N(x) = Cumulative Normal CDF, n(x) = Normal PDF
+# ==============================================================================
+
+# 1. MATHEMATICAL ENGINE & VECTORIZED OPTION GENERATOR
+# ==============================================================================
+
+class OptionsMarketSimulator:
+    """
+    Simulates real-time options chain data and computes dealer Gamma Exposure (GEX),
+    Vanna Exposure (VEX), and Charm Exposure (CEX) using institutional-grade 
+    Black-Scholes modeling and vol-skew curves.
+    """
+    def __init__(self, ticker="SPX", spot=5350.0, vol=0.15, rate=0.045, dividend=0.015, call_ratio=0.5, put_ratio=-0.6):
+        self.ticker = ticker
+        self.spot = spot
+        self.vol = vol
+        self.rate = rate
+        self.dividend = dividend
+        self.call_ratio = call_ratio
+        self.put_ratio = put_ratio
+        self.contract_size = 100
+        
+    def generate_option_chain(self, current_spot):
+        """
+        Generates a synthetic options chain with realistic strike clustering,
+        volatility smile/skew, and open interest distribution. Appends Vanna and Charm.
+        """
+        np.random.seed(int(current_spot) % 1000 + 42) # Deterministic yet changing
+        
+        # Determine strike range around current spot (+/- 10%)
+        step = 10 if self.ticker in ["SPX", "NDX"] else 1
+        num_strikes = 40
+        min_strike = int((current_spot * 0.90) / step) * step
+        max_strike = int((current_spot * 1.10) / step) * step
+        strikes = np.arange(min_strike, max_strike + step, step)
+        
+        # Simulate different expirations: 0DTE, 1W, 1M, 3M
+        days_to_expiry = [0.004, 0.019, 0.082, 0.25] # In fractions of a year
+        exp_labels = ["0DTE", "1-Week", "1-Month", "3-Month"]
+        
+        records = []
+        
+        for dte, exp_label in zip(days_to_expiry, exp_labels):
+            for strike in strikes:
+                # 1. Volatility Smile Model (Skew): Puts have higher implied volatility
+                distance = (strike - current_spot) / current_spot
+                strike_iv = self.vol + 0.15 * (distance ** 2) - 0.12 * distance
+                strike_iv = np.clip(strike_iv, 0.05, 0.60)
+                
+                # 2. Open Interest distribution (Clustered around psychological levels)
+                base_oi = np.exp(-0.5 * (distance / 0.04) ** 2) * 50000
+                psy_level = 100 if self.ticker in ["SPX", "NDX"] else 10
+                half_psy_level = 50 if self.ticker in ["SPX", "NDX"] else 5
+                
+                if strike % psy_level == 0:
+                    base_oi *= 2.5
+                elif strike % half_psy_level == 0:
+                    base_oi *= 1.6
+                
+                # 3. Simulate Total Exposure Size per Strike
+                call_oi = np.random.randint(100, 5000)
+                put_oi = np.random.randint(100, 5000)
+                
+                # 4. Generate the Black-Scholes Greeks using the exact same logic
+                #    used in the batch engine, but applied point-by-point for the sim
+                for opt_type, oi, ratio in [("Call", call_oi, self.call_ratio), ("Put", put_oi, self.put_ratio)]:
+                    g, d, vanna, charm = self._black_scholes_greeks(current_spot, strike, dte, strike_iv, opt_type)
+                    
+                    # Calculate Notional Gamma Exposure (GEX) per 1% underlying move
+                    gex = g * self.contract_size * oi * ratio * (current_spot ** 2) * 0.01
+                    
+                    # Vanna Exposure (VEX): Change in Dollar Delta per 1% absolute point move in IV
+                    vex = vanna * self.contract_size * oi * ratio * current_spot * 0.01
+                    
+                    # Charm Exposure (CEX): Daily Delta decay bleed (scaled to days via / 365)
+                    cex = (charm / 365.0) * self.contract_size * oi * ratio * current_spot
+                    
+                    records.append({
+                        "Expiration": exp_label,
+                        "Strike": strike,
+                        "Type": opt_type,
+                        "IV": strike_iv,
+                        "OI": oi,
+                        "Delta": d,
+                        "Gamma": g,
+                        "GEX": gex,
+                        "Vanna": vanna,
+                        "VEX": vex,
+                        "Charm": charm,
+                        "CEX": cex,
+                        "DTE": dte
+                    })
+                    
+        return pd.DataFrame(records)
+
+    def _black_scholes_greeks(self, S, K, T, v, opt_type):
+        """
+        Scalar analytical Black-Scholes solver for a single option contract.
+        Used internally by generate_option_chain() for the simulated chain.
+        (The vectorized batch version for real data is add_greeks_to_df.)
+
+        Parameters:
+            S        : Spot price of the underlying asset
+            K        : Strike price of the option
+            T        : Time to expiration in YEARS (e.g. 1 day = 1/365 = 0.00274)
+            v        : Implied volatility as decimal (e.g. 0.20 for 20% IV)
+            opt_type : "Call" or "Put"
+
+        Returns: (gamma, delta, vanna, charm)
+
+        Edge case handling:
+            T <= 0: Option expired. Return intrinsic delta (1.0, -1.0, or 0.0).
+            v < 1e-5: Clamp to avoid division-by-zero in the d1 formula.
+        """
+        if T <= 0:
+            if opt_type == "Call":
+                return 0.0, (1.0 if S >= K else 0.0), 0.0, 0.0
+            else:
+                return 0.0, (-1.0 if S < K else 0.0), 0.0, 0.0
+                
+        v = max(v, 1e-5)
+        sqrt_T = np.sqrt(T)
+        d1 = (np.log(S / K) + (self.rate - self.dividend + 0.5 * v ** 2) * T) / (v * sqrt_T)
+        d2 = d1 - v * sqrt_T
+        
+        n_d1 = np.exp(-d1 ** 2 / 2) / np.sqrt(2 * np.pi)
+        
+        # Gamma (identical for Call and Put)
+        gamma = (np.exp(-self.dividend * T) * n_d1) / (S * v * sqrt_T)
+        
+        # Vanna (dVega/dSpot or dDelta/dVol)
+        vanna = -np.exp(-self.dividend * T) * n_d1 * d2 / v
+        
+        # Charm (dDelta/dT - passage of time derivative)
+        charm_common = n_d1 * ((self.rate - self.dividend) / (v * sqrt_T) - d2 / (2 * T))
+        if opt_type == "Call":
+            delta = np.exp(-self.dividend * T) * ndtr(d1)
+            charm = self.dividend * np.exp(-self.dividend * T) * ndtr(d1) - np.exp(-self.dividend * T) * charm_common
+        else:
+            delta = -np.exp(-self.dividend * T) * ndtr(-d1)
+            charm = -self.dividend * np.exp(-self.dividend * T) * ndtr(-d1) - np.exp(-self.dividend * T) * charm_common
+            
+        return gamma, delta, vanna, charm
+
+    def add_greeks_to_df(self, df, current_spot):
+        """
+        Vectorized batch Greek engine for processing real market data at speed.
+
+        Instead of calling _black_scholes_greeks() once per row (which is slow),
+        this function uses NumPy broadcasting to compute ALL contracts at once.
+        This is the critical path that makes the 3-second refresh interval possible.
+
+        Expected input columns: Strike, DTE, IV, OI, Type ("Call" or "Put")
+
+        Exposure formulas:
+            GEX = Gamma * ContractSize * OI * DealerRatio * Spot^2 * 0.01
+                  Interpretation: dollars of delta-hedge flow per 1% spot move
+
+            VEX = Vanna * ContractSize * OI * DealerRatio * Spot * 0.01
+                  Interpretation: dollars of delta change per 1% absolute IV shift
+
+            CEX = (Charm / 365) * ContractSize * OI * DealerRatio * Spot
+                  Interpretation: dollars of passive daily delta decay (time bleed)
+
+        Dealer Position Assumptions (standard GEX convention):
+            Calls: dealers are net SHORT -> ratio = +0.5 -> positive GEX
+            Puts:  dealers are net LONG  -> ratio = -0.6 -> negative GEX
+        """
+        if df.empty:
+            return df
+            
+        S = current_spot
+        K = df["Strike"].values
+        T = df["DTE"].values
+        v = df["IV"].values
+        OI = df["OI"].values
+        opt_types = df["Type"].values
+        
+        # Ensure T > 0 and v > 0 to avoid division by zero
+        T_safe = np.where(T <= 0, 1e-5, T)
+        v_safe = np.where(v <= 0, 1e-5, v)
+        sqrt_T = np.sqrt(T_safe)
+        
+        d1 = (np.log(S / K) + (self.rate - self.dividend + 0.5 * v_safe ** 2) * T_safe) / (v_safe * sqrt_T)
+        d2 = d1 - v_safe * sqrt_T
+        n_d1 = np.exp(-d1 ** 2 / 2) / np.sqrt(2 * np.pi)
+        
+        # Gamma
+        gamma = (np.exp(-self.dividend * T_safe) * n_d1) / (S * v_safe * sqrt_T)
+        
+        # Vanna
+        vanna = -np.exp(-self.dividend * T_safe) * n_d1 * d2 / v_safe
+        
+        # Charm
+        charm_common = n_d1 * ((self.rate - self.dividend) / (v_safe * sqrt_T) - d2 / (2 * T_safe))
+        ndtr_d1 = ndtr(d1)
+        
+        charm_call = self.dividend * np.exp(-self.dividend * T_safe) * ndtr_d1 - np.exp(-self.dividend * T_safe) * charm_common
+        charm_put = -self.dividend * np.exp(-self.dividend * T_safe) * (1.0 - ndtr_d1) - np.exp(-self.dividend * T_safe) * charm_common
+        charm = np.where(opt_types == "Call", charm_call, charm_put)
+        
+        # Delta
+        delta_call = np.exp(-self.dividend * T_safe) * ndtr_d1
+        delta_put = -np.exp(-self.dividend * T_safe) * (1.0 - ndtr_d1)
+        delta = np.where(opt_types == "Call", delta_call, delta_put)
+        
+        # Dealer ratios
+        ratios = np.where(opt_types == "Call", 0.5, -0.6)
+        
+        # Exposures
+        gex = gamma * self.contract_size * OI * ratios * (S ** 2) * 0.01
+        vex = vanna * self.contract_size * OI * ratios * S * 0.01
+        cex = (charm / 365.0) * self.contract_size * OI * ratios * S
+        
+        df["Delta"] = delta
+        df["Gamma"] = gamma
+        df["GEX"] = gex
+        df["Vanna"] = vanna
+        df["VEX"] = vex
+        df["Charm"] = charm
+        df["CEX"] = cex
+        
+        return df
+
+    def compute_exposure_profiles(self, chain_df, current_spot, price_range_pct=0.10, steps=50):
+        """
+        Sweeps the underlying price across a range and computes total exposure at each level.
+
+        This is the most computationally intensive function. It builds a 2D matrix
+        of shape (50 price steps x N contracts) using NumPy broadcasting, computing
+        each contract's Greek contribution at every price level simultaneously.
+
+        Returns:
+            profile_df     : DataFrame(UnderlyingPrice, NetGEX, NetVEX, NetCEX)
+                             The summed exposure at each price point -- drives the
+                             continuous profile line chart (top panel).
+
+            flip_price     : The interpolated zero-crossing of NetGEX.
+                             Found using sign-change detection (np.sign + np.diff)
+                             with linear interpolation for sub-grid precision.
+
+            unique_strikes  : Sorted array of unique strike prices (heatmap y-axis)
+
+            gex/vex/cex_mat : 2D matrices [price_steps x unique_strikes]
+                              Each cell = that strike's exposure at that price.
+                              Transposed (.T) before passing to go.Heatmap.
+        """
+        if chain_df.empty:
+            return pd.DataFrame(columns=["UnderlyingPrice", "NetGEX", "NetVEX", "NetCEX"]), current_spot, np.array([]), np.zeros((steps, 0)), np.zeros((steps, 0)), np.zeros((steps, 0))
+
+        min_price = current_spot * (1.0 - price_range_pct)
+        max_price = current_spot * (1.0 + price_range_pct)
+        
+        P = np.linspace(min_price, max_price, steps).reshape(-1, 1)
+        K = chain_df["Strike"].values.reshape(1, -1)
+        T = chain_df["DTE"].values.reshape(1, -1)
+        V = chain_df["IV"].values.reshape(1, -1)
+        OI = chain_df["OI"].values.reshape(1, -1)
+        ratios = np.where(chain_df["Type"] == "Call", self.call_ratio, self.put_ratio).reshape(1, -1)
+        is_call = (chain_df["Type"] == "Call").values.reshape(1, -1)
+        
+        T = np.where(T <= 0, 1e-5, T)
+        V = np.where(V <= 0, 1e-5, V)
+
+        # BS calculations
+        d1 = (np.log(P / K) + (self.rate - self.dividend + 0.5 * V ** 2) * T) / (V * np.sqrt(T))
+        d2 = d1 - V * np.sqrt(T)
+        n_d1 = np.exp(-d1 ** 2 / 2) / np.sqrt(2 * np.pi)
+        
+        # 1. Gamma & GEX
+        gamma = (np.exp(-self.dividend * T) * n_d1) / (P * V * np.sqrt(T))
+        gex_matrix = gamma * self.contract_size * OI * ratios * (P ** 2) * 0.01
+        net_gex_profile = np.sum(gex_matrix, axis=1)
+        
+        # 2. Vanna & VEX
+        vanna = -np.exp(-self.dividend * T) * n_d1 * d2 / V
+        vex_matrix = vanna * self.contract_size * OI * ratios * P * 0.01
+        net_vex_profile = np.sum(vex_matrix, axis=1)
+        
+        # 3. Charm & CEX
+        charm_common = n_d1 * ((self.rate - self.dividend) / (V * np.sqrt(T)) - d2 / (2 * T))
+        ndtr_d1 = ndtr(d1)
+        charm = np.where(
+            is_call,
+            self.dividend * np.exp(-self.dividend * T) * ndtr_d1 - np.exp(-self.dividend * T) * charm_common,
+            -self.dividend * np.exp(-self.dividend * T) * (1.0 - ndtr_d1) - np.exp(-self.dividend * T) * charm_common
+        )
+        cex_matrix = (charm / 365.0) * self.contract_size * OI * ratios * P
+        net_cex_profile = np.sum(cex_matrix, axis=1)
+
+        # Group exposure matrices by unique strike prices
+        strikes_arr = chain_df["Strike"].values
+        unique_strikes = np.unique(strikes_arr)
+        
+        gex_strike_matrix = np.zeros((steps, len(unique_strikes)))
+        vex_strike_matrix = np.zeros((steps, len(unique_strikes)))
+        cex_strike_matrix = np.zeros((steps, len(unique_strikes)))
+        
+        for idx, strike in enumerate(unique_strikes):
+            mask = (strikes_arr == strike)
+            gex_strike_matrix[:, idx] = np.sum(gex_matrix[:, mask], axis=1)
+            vex_strike_matrix[:, idx] = np.sum(vex_matrix[:, mask], axis=1)
+            cex_strike_matrix[:, idx] = np.sum(cex_matrix[:, mask], axis=1)
+
+        profile_df = pd.DataFrame({
+            "UnderlyingPrice": P.flatten(),
+            "NetGEX": net_gex_profile,
+            "NetVEX": net_vex_profile,
+            "NetCEX": net_cex_profile
+        })
+        
+        flip_price = current_spot
+        try:
+            # Check if there is a sign crossing
+            if np.sign(net_gex_profile.max()) != np.sign(net_gex_profile.min()):
+                # Create a highly precise mathematical spline representation of the NetGEX curve
+                # Smoothing factor s=0 ensures it passes exactly through our points
+                spline = UnivariateSpline(profile_df["UnderlyingPrice"], profile_df["NetGEX"], s=0)
+                
+                # Find the roots (zero-crossings) of the spline function
+                roots = spline.roots()
+                
+                if len(roots) > 0:
+                    # If multiple roots exist, pick the one closest to the current spot price
+                    flip_price = roots[np.abs(roots - current_spot).argmin()]
+        except Exception:
+            pass
+            
+        return profile_df, flip_price, unique_strikes, gex_strike_matrix, vex_strike_matrix, cex_strike_matrix
+
+# ==============================================================================
+# SECTION 4: DASH APPLICATION SETUP AND UI LAYOUT
+# ==============================================================================
+# Dash is a Python web framework built on React + Flask. The layout is declared
+# as a Python object tree that Dash converts into HTML/CSS/JavaScript.
+#
+# How Dash reactivity works:
+#   1. Every UI element has a unique string id (e.g. "metric-spot")
+#   2. @app.callback decorators wire Inputs -> function -> Outputs
+#   3. When any Input changes, Dash automatically calls the Python function
+#      and pushes the return values to the Output component properties
+#   4. dcc.Interval fires automatically every N milliseconds, triggering
+#      the main engine callback without any user action
+#
+# Theme: Bootstrap CYBORG dark theme via dash_bootstrap_components.
+#        This provides the dark background, card borders, and button styles.
+# ==============================================================================
+# 2. DASH SYSTEM LAYOUT AND THEME DEFINITION
+# ==============================================================================
+
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.CYBORG],
+    meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1.0"}]
+)
+app.title = "Real-Time Options Cross-Greek Exposure Monitor"
+
+market = OptionsMarketSimulator(ticker="SPX", spot=5350.00)
+
+app.layout = dbc.Container([
+    # Top Control & Title Bar
+    dbc.Row([
+        dbc.Col([
+            html.Div([
+                html.Span("⚡ QUANTUM HEDGE", className="text-primary font-weight-bold", style={"letterSpacing": "3px", "fontSize": "12px"}),
+                html.H1("REAL-TIME SYSTEMIC GEX / VEX / CEX ENGINE", className="text-light font-weight-bold m-0", style={"fontSize": "26px"})
+            ])
+        ], md=8, className="py-3"),
+        dbc.Col([
+            html.Div([
+                dbc.Button("RESET ENGINE", id="btn-reset", color="outline-warning", size="sm", className="me-2"),
+                dbc.Button("LIVE FEED: ON", id="btn-live", color="success", size="sm", className="active-glow")
+            ], className="d-flex align-items-center justify-content-end h-100")
+        ], md=4, className="py-3")
+    ], className="border-bottom border-dark mb-4"),
+
+    # Symmetrical 6-Card Metric Matrix
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardBody([
+                    html.P("UNDERLYING SPOT PRICE", className="text-muted mb-1 small-title"),
+                    html.H2(id="metric-spot", className="text-light font-weight-bold", style={"fontFamily": "monospace"}),
+                    html.Div(id="metric-spot-change", className="small")
+                ])
+            ], className="glassmorphism-card metric-card h-100")
+        ], lg=4, md=6, className="mb-4"),
+        dbc.Col([
+            dbc.Card([
+                dbc.CardBody([
+                    html.P("NET MARKET GEX", className="text-muted mb-1 small-title"),
+                    html.H2(id="metric-net-gex", className="font-weight-bold", style={"fontFamily": "monospace"}),
+                    html.Div("Total Delta-hedging flow per 1% spot move", className="small text-muted")
+                ])
+            ], className="glassmorphism-card metric-card h-100")
+        ], lg=4, md=6, className="mb-4"),
+        dbc.Col([
+            dbc.Card([
+                dbc.CardBody([
+                    html.P("GAMMA FLIP LEVEL", className="text-muted mb-1 small-title"),
+                    html.H2(id="metric-gamma-flip", className="text-warning font-weight-bold", style={"fontFamily": "monospace"}),
+                    html.Div(id="metric-flip-distance", className="small")
+                ])
+            ], className="glassmorphism-card metric-card h-100")
+        ], lg=4, md=6, className="mb-4"),
+    ]),
+
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardBody([
+                    html.P("NET MARKET VANNA (VEX)", className="text-muted mb-1 small-title"),
+                    html.H2(id="metric-net-vex", className="font-weight-bold", style={"fontFamily": "monospace"}),
+                    html.Div("Delta sensitivity per 1% absolute Vol shift", className="small text-muted")
+                ])
+            ], className="glassmorphism-card metric-card h-100")
+        ], lg=4, md=6, className="mb-4"),
+        dbc.Col([
+            dbc.Card([
+                dbc.CardBody([
+                    html.P("NET MARKET CHARM (CEX)", className="text-muted mb-1 small-title"),
+                    html.H2(id="metric-net-cex", className="font-weight-bold", style={"fontFamily": "monospace"}),
+                    html.Div("Daily passive Delta decay bleed", className="small text-muted")
+                ])
+            ], className="glassmorphism-card metric-card h-100")
+        ], lg=4, md=6, className="mb-4"),
+        dbc.Col([
+            dbc.Card([
+                dbc.CardBody([
+                    html.P("MARKET VOL REGIME", className="text-muted mb-1 small-title"),
+                    html.H2(id="metric-regime", className="font-weight-bold"),
+                    html.Div(id="metric-regime-desc", className="small text-muted")
+                ])
+            ], className="glassmorphism-card metric-card h-100")
+        ], lg=4, md=6, className="mb-4")
+    ]),
+
+    # Schwab API Connection Desk
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader([
+                    html.Div([
+                        html.Span("🔌 SCHWAB API DESK (LIVE FEED)", className="font-weight-bold text-light mt-1"),
+                        html.Span("SIMULATED DATA", id="schwab-status-badge", className="badge bg-secondary ms-auto", style={"fontSize": "10px", "padding": "5px 10px"})
+                    ], className="d-flex w-100 align-items-center")
+                ], className="bg-transparent border-bottom border-dark"),
+                dbc.CardBody([
+                    dbc.Row([
+                        dbc.Col([
+                            html.Label("APP KEY", className="text-muted small"),
+                            dbc.Input(id="schwab-app-key", type="text", placeholder="App Key", className="bg-dark text-light border-secondary mb-2", style={"fontFamily": "monospace", "fontSize": "12px"})
+                        ], lg=3, md=6),
+                        dbc.Col([
+                            html.Label("APP SECRET", className="text-muted small"),
+                            dbc.Input(id="schwab-app-secret", type="password", placeholder="App Secret", className="bg-dark text-light border-secondary mb-2", style={"fontFamily": "monospace", "fontSize": "12px"})
+                        ], lg=3, md=6),
+                        dbc.Col([
+                            html.Label("REDIRECT URI", className="text-muted small"),
+                            dbc.Input(id="schwab-redirect-uri", type="text", placeholder="Redirect URI", className="bg-dark text-light border-secondary mb-2", style={"fontSize": "12px"})
+                        ], lg=3, md=6),
+                        dbc.Col([
+                            html.Label("CREDENTIAL ACTIONS", className="text-muted small d-block"),
+                            dbc.Button("SAVE KEYS", id="schwab-btn-save-keys", color="outline-info", size="sm", className="w-100 mb-2")
+                        ], lg=3, md=6)
+                    ]),
+                    html.Hr(className="border-secondary my-3"),
+                    dbc.Row([
+                        dbc.Col([
+                            html.Label("1. OAUTH STEP", className="text-muted small d-block"),
+                            dbc.Button("GENERATE AUTH LINK", id="schwab-btn-gen-link", color="outline-warning", size="sm", className="w-100 mb-2"),
+                            html.Div(id="schwab-auth-link-container", className="text-center my-1")
+                        ], lg=4, md=6),
+                        dbc.Col([
+                            html.Label("2. AUTH CODE / REDIRECT URL", className="text-muted small"),
+                            dbc.Input(id="schwab-auth-code-input", type="text", placeholder="Paste Schwab Redirect URL or code here...", className="bg-dark text-light border-secondary mb-2", style={"fontSize": "12px"})
+                        ], lg=5, md=6),
+                        dbc.Col([
+                            html.Label("3. ESTABLISH CONNECT", className="text-muted small d-block"),
+                            dbc.Button("CONNECT SCHWAB LIVE", id="schwab-btn-connect", color="success", size="sm", className="w-100 mb-2")
+                        ], lg=3, md=12)
+                    ]),
+                    html.Div(id="schwab-status-message", className="mt-2 text-warning small text-center")
+                ])
+            ], className="bg-dark border-secondary mb-4")
+        ], width=12)
+    ]),
+
+    # Configuration Control Panel
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader("ARCHITECT CONTROL DESK", className="bg-transparent border-bottom border-dark text-primary font-weight-bold"),
+                dbc.CardBody([
+                    dbc.Row([
+                        dbc.Col([
+                            html.Label("UNDERLYING SYMBOL", className="text-muted small"),
+                            dcc.Dropdown(
+                                id="dropdown-ticker",
+                                options=[
+                                    {"label": "S&P 500 Index (SPX)", "value": "SPX"},
+                                    {"label": "Nasdaq 100 Index (NDX)", "value": "NDX"},
+                                    {"label": "Apple Inc. (AAPL)", "value": "AAPL"},
+                                    {"label": "NVIDIA Corp. (NVDA)", "value": "NVDA"}
+                                ],
+                                value="SPX",
+                                clearable=False,
+                                className="bg-dark text-light mb-3"
+                            )
+                        ], lg=3, md=6),
+                        dbc.Col([
+                            html.Label("TERM EXPIRATIONS FILTER", className="text-muted small"),
+                            dcc.Dropdown(
+                                id="dropdown-expiration",
+                                options=[
+                                    {"label": "All Expirations", "value": "ALL"},
+                                    {"label": "0DTE Intraday Magnets", "value": "0DTE"},
+                                    {"label": "Short-Term Weekly (1-W)", "value": "1-Week"},
+                                    {"label": "Monthly Options (1-M)", "value": "1-Month"}
+                                ],
+                                value="ALL",
+                                clearable=False,
+                                className="bg-dark text-light mb-3"
+                            )
+                        ], lg=3, md=6),
+                        dbc.Col([
+                            html.Label("VOLATILITY SMILE PARAMETER (ATM IV)", className="text-muted small"),
+                            dcc.Slider(
+                                id="slider-vol",
+                                min=0.08,
+                                max=0.45,
+                                step=0.01,
+                                value=0.16,
+                                marks={0.10: "10%", 0.20: "20%", 0.30: "30%", 0.40: "40%"},
+                                className="mb-3"
+                            )
+                        ], lg=3, md=6),
+                        dbc.Col([
+                            html.Label("SYSTEM REFRESH FREQUENCY", className="text-muted small"),
+                            dcc.RadioItems(
+                                id="radio-refresh",
+                                options=[
+                                    {"label": " 3 sec (Live)", "value": 3},
+                                    {"label": " 10 sec", "value": 10},
+                                    {"label": " Paused", "value": 9999}
+                                ],
+                                value=3,
+                                labelClassName="text-light me-3",
+                                inputStyle={"marginRight": "5px"}
+                            )
+                        ], lg=3, md=6)
+                    ]),
+                    html.Hr(className="border-secondary my-3"),
+                    dbc.Row([
+                        dbc.Col([
+                            html.Label("DEALER CALL POSITIONING RATIO (0.5 = 50% SHORT)", className="text-muted small"),
+                            dcc.Slider(
+                                id="slider-call-ratio",
+                                min=0.0,
+                                max=1.0,
+                                step=0.1,
+                                value=0.5,
+                                marks={0.0: "0 (Flat)", 0.5: "50%", 1.0: "100%"},
+                                className="mb-2"
+                            )
+                        ], lg=6, md=12),
+                        dbc.Col([
+                            html.Label("DEALER PUT POSITIONING RATIO (-0.6 = 60% LONG)", className="text-muted small"),
+                            dcc.Slider(
+                                id="slider-put-ratio",
+                                min=-1.0,
+                                max=0.0,
+                                step=0.1,
+                                value=-0.6,
+                                marks={-1.0: "-100%", -0.6: "-60%", 0.0: "0 (Flat)"},
+                                className="mb-2"
+                            )
+                        ], lg=6, md=12)
+                    ])
+                ])
+            ], className="bg-dark border-secondary mb-4")
+        ], width=12)
+    ]),
+
+    # Data Visualizations Viewports
+    dbc.Row([
+        # Left Panel - Greek Strike Selection distribution
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader([
+                    html.Div([
+                        html.Span("CONCENTRATION BY STRIKE (LIQUIDITY WALLS)", className="font-weight-bold text-light mt-1"),
+                        dcc.RadioItems(
+                            id="radio-greek-select",
+                            options=[
+                                {"label": " GEX (Gamma)", "value": "GEX"},
+                                {"label": " VEX (Vanna)", "value": "VEX"},
+                                {"label": " CEX (Charm)", "value": "CEX"}
+                            ],
+                            value="GEX",
+                            labelClassName="text-muted me-3 small font-weight-bold",
+                            inputStyle={"marginRight": "4px", "marginLeft": "12px"},
+                            className="ms-auto d-flex align-items-center"
+                        )
+                    ], className="d-flex w-100 align-items-center")
+                ], className="bg-transparent border-bottom border-dark"),
+                dbc.CardBody([
+                    dcc.Graph(id="graph-gex-strikes", style={"height": "480px"}, config={"displayModeBar": False})
+                ])
+            ], className="bg-dark border-secondary mb-4")
+        ], lg=8, md=12),
+        
+        # Right Panel - Hedging Profile
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader("DEALER SYSTEMIC EXPOSURE PROFILES (GEX / VEX / CEX)", className="bg-transparent border-bottom border-dark font-weight-bold text-light"),
+                dbc.CardBody([
+                    dcc.Graph(id="graph-gamma-profile", style={"height": "650px"}, config={"displayModeBar": False})
+                ])
+            ], className="bg-dark border-secondary mb-4")
+        ], lg=4, md=12)
+    ]),
+
+    # Order Book Depth Breakdown
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader("AGGREGATED INSTITUTIONAL HEDGING LEVELS & LIQUIDITY MAP", className="bg-transparent border-bottom border-dark font-weight-bold text-light"),
+                dbc.CardBody([
+                    dbc.Row([
+                        dbc.Col([
+                            html.Div([
+                                html.P("CALL WALL (MAJOR RESISTANCE)", className="text-success font-weight-bold small-title mb-1"),
+                                html.H3(id="level-call-wall", style={"fontFamily": "monospace"}),
+                                html.P("Largest concentration of Call Gamma", className="text-muted small")
+                            ], className="text-center p-3 border border-dark rounded bg-black-opacity")
+                        ], md=4, className="mb-3"),
+                        dbc.Col([
+                            html.Div([
+                                html.P("GAMMA FLIP DESK", className="text-warning font-weight-bold small-title mb-1"),
+                                html.H3(id="level-gamma-flip", style={"fontFamily": "monospace"}),
+                                html.P("Regime shift transition trigger point", className="text-muted small")
+                            ], className="text-center p-3 border border-dark rounded bg-black-opacity")
+                        ], md=4, className="mb-3"),
+                        dbc.Col([
+                            html.Div([
+                                html.P("PUT WALL (MAJOR SUPPORT)", className="text-danger font-weight-bold small-title mb-1"),
+                                html.H3(id="level-put-wall", style={"fontFamily": "monospace"}),
+                                html.P("Largest concentration of Put Gamma", className="text-muted small")
+                            ], className="text-center p-3 border border-dark rounded bg-black-opacity")
+                        ], md=4, className="mb-3")
+                    ])
+                ])
+            ], className="bg-dark border-secondary mb-4")
+        ], width=12)
+    ]),
+
+    # System State Stores & Timers
+    dcc.Interval(id="system-tick", interval=3000, n_intervals=0),
+    dcc.Store(id="spot-tracker-store", data={"spot": 5350.00, "prev_spot": 5350.00})
+], fluid=True, style={"backgroundColor": "#0d0e12", "minHeight": "100vh", "padding": "20px"})
+
+# Custom styles for modern layout
+app.index_string = '''
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>
+            .small-title { letter-spacing: 1.5px; font-size: 11px; font-weight: 700; }
+            .bg-black-opacity { background-color: rgba(0, 0, 0, 0.35); }
+            .active-glow { box-shadow: 0 0 10px rgba(40, 167, 69, 0.6); animation: pulse 2s infinite; }
+            @keyframes pulse {
+                0% { opacity: 0.9; }
+                50% { opacity: 1; box-shadow: 0 0 16px rgba(40, 167, 69, 0.95); }
+                100% { opacity: 0.9; }
+            }
+            ::-webkit-scrollbar { width: 6px; height: 6px; }
+            ::-webkit-scrollbar-track { background: #0d0e12; }
+            ::-webkit-scrollbar-thumb { background: #1f232b; border-radius: 3px; }
+            ::-webkit-scrollbar-thumb:hover { background: #3f4756; }
+        </style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>{%config%}{%scripts%}{%renderer%}</footer>
+    </body>
+</html>
+'''
+
+# ==============================================================================
+# SECTION 5: INTERACTIVE CALLBACK CONTROLLERS
+# ==============================================================================
+# Callbacks are the reactive core of Dash. Each @app.callback declares:
+#   Output  : Which component property to UPDATE when the function runs
+#   Input   : Which component property TRIGGERS the function when it changes
+#   State   : Which component property to READ passively (no trigger)
+#
+# The main engine callback fires on EVERY heartbeat tick (dcc.Interval) AND
+# whenever the user changes any control (ticker, expiration, vol, greek).
+# It returns 22 output values that simultaneously update every metric card
+# and both charts in a single synchronous render cycle.
+# ==============================================================================
+# 3. INTERACTIVE CALLBACK CONTROLLERS
+# ==============================================================================
+
+def format_exposure(val):
+    """
+    Format a raw dollar exposure value into a human-readable abbreviated string.
+    Automatically scales to Billions (Bn), Millions (Mn), or Thousands (K).
+    Preserves the sign using a string prefix so formatting is culture-agnostic.
+
+    Examples: 2,400,000,000 -> "$2.40 Bn"  |  -560,000 -> "-$560.00 K"
+    """
+    prefix = "-" if val < 0 else ""
+    abs_val = abs(val)
+    if abs_val >= 1e9:
+        return f"{prefix}${abs_val / 1e9:.2f} Bn"
+    elif abs_val >= 1e6:
+        return f"{prefix}${abs_val / 1e6:.2f} Mn"
+    elif abs_val >= 1e3:
+        return f"{prefix}${abs_val / 1e3:.2f} K"
+    else:
+        return f"{prefix}${abs_val:.2f}"
+
+def map_symbol_to_schwab(ticker):
+    """
+    Map a generic ticker to the Schwab API symbol format.
+    Schwab requires index symbols to be prefixed with $:
+      SPX -> $SPX,  NDX -> $NDX
+    Equity symbols (AAPL, NVDA) are passed through unchanged.
+    """
+    if ticker in ["SPX", "NDX"]:
+        return f"${ticker}"
+    return ticker
+
+@app.callback(
+    Output("system-tick", "interval"),
+    Input("radio-refresh", "value")
+)
+def update_refresh_frequency(secs):
+    return secs * 1000
+
+@app.callback(
+    [
+        Output("spot-tracker-store", "data"),
+        Output("metric-spot", "children"),
+        Output("metric-spot-change", "children"),
+        Output("metric-spot-change", "className"),
+        Output("metric-net-gex", "children"),
+        Output("metric-net-gex", "className"),
+        Output("metric-net-vex", "children"),
+        Output("metric-net-vex", "className"),
+        Output("metric-net-cex", "children"),
+        Output("metric-net-cex", "className"),
+        Output("metric-gamma-flip", "children"),
+        Output("metric-flip-distance", "children"),
+        Output("metric-flip-distance", "className"),
+        Output("metric-regime", "children"),
+        Output("metric-regime", "className"),
+        Output("metric-regime-desc", "children"),
+        Output("level-call-wall", "children"),
+        Output("level-gamma-flip", "children"),
+        Output("level-put-wall", "children"),
+        Output("graph-gex-strikes", "figure"),
+        Output("graph-gamma-profile", "figure"),
+        Output("schwab-status-badge", "children"),
+        Output("schwab-status-badge", "className")
+    ],
+    [
+        Input("system-tick", "n_intervals"),
+        Input("dropdown-ticker", "value"),
+        Input("dropdown-expiration", "value"),
+        Input("slider-vol", "value"),
+        Input("radio-greek-select", "value"),
+        Input("slider-call-ratio", "value"),
+        Input("slider-put-ratio", "value"),
+        Input("btn-reset", "n_clicks")
+    ],
+    [State("spot-tracker-store", "data")]
+)
+def run_real_time_quant_engine(n, ticker, expiration, vol, greek_selection, call_ratio, put_ratio, reset_btn, current_state):
+    """
+    THE MAIN ENGINE CALLBACK -- fires on every heartbeat tick and user input change.
+
+    Execution flow (in order):
+      1. Detect which component triggered this callback (tick vs user control)
+      2. Proactively refresh the Schwab access_token if it is about to expire
+      3. Instantiate DataPipelineManager and fetch data (Schwab -> Yahoo -> Sim)
+      4. Pass raw chain through the vectorized Greek engine (add_greeks_to_df)
+      5. Filter the chain by the selected expiration bucket (0DTE, 1-Week, etc)
+      6. Compute per-strike aggregated exposure and identify Call/Put Walls
+      7. Compute the continuous GEX/VEX/CEX profile and Gamma Flip level
+      8. Format all text values for the 6 metric header cards
+      9. Build Chart 1: Per-strike bar chart (colored by positive/negative)
+      10. Build Chart 2: Continuous profile line chart + 2D concentration heatmap
+      11. Return all 22 outputs to Dash for a synchronized single-render update
+    """
+    # ---- STEP 1: Determine what triggered this callback ----
+    # triggered_id is used by SimulatedProvider to decide whether to apply
+    # random micro-drift noise (only on auto ticks, not user control changes)
+    ctx = dash.callback_context
+    triggered_id = ctx.triggered[0]["prop_id"].split(".")[0] if ctx.triggered else ""
+
+    # Fallback spot prices -- shown before any live data arrives on startup
+    base_spots = {"SPX": 5350.00, "NDX": 18600.00, "AAPL": 185.00, "NVDA": 135.00}
+    current_base = base_spots.get(ticker, 5000.00)
+    
+    if not current_state or not isinstance(current_state, dict):
+        current_state = {"spot": current_base, "prev_spot": current_base}
+    
+    if triggered_id in ["btn-reset", "dropdown-ticker", "", "."]:
+        spot = current_base
+        prev_spot = current_base
+    else:
+        prev_spot = current_state.get("spot", current_base)
+        spot = prev_spot
+        
+    # ---- STEP 2: Proactive token refresh ----
+    # Check if the Schwab access_token expires within 60 seconds.
+    # If so, use the refresh_token to silently get a new access_token.
+    # This prevents mid-session disconnects during live market hours.
+    tokens = load_schwab_tokens()
+    if tokens.get("access_token") and tokens.get("refresh_token"):
+        if time.time() > (tokens.get("expires_at", 0) - 60):
+            success, _ = refresh_schwab_access_token(tokens)
+            if success:
+                tokens = load_schwab_tokens()  # Reload with the freshly issued token
+
+    # ---- STEP 3: Fetch data through the decoupled pipeline ----
+    # Instantiate the Math Engine with live Risk-Free Rate and User Dealer Ratios
+    market = OptionsMarketSimulator(
+        ticker=ticker, 
+        spot=spot, 
+        vol=vol, 
+        rate=get_live_risk_free_rate(), 
+        call_ratio=call_ratio, 
+        put_ratio=put_ratio
+    )
+    
+    # DataPipelineManager tries each provider in priority order.
+    # The math engine below this block is completely unaware of the data source.
+    pipeline = DataPipelineManager([
+        SchwabProvider(),                        # Priority 1: Live Schwab brokerage data
+        YFinanceProvider(),                      # Priority 2: Yahoo Finance (free fallback)
+        SimulatedProvider(market, triggered_id)  # Priority 3: Local Monte Carlo simulation
+    ])
+    spot, raw_chain, source_name = pipeline.fetch_best_data(ticker, spot, vol, tokens=tokens)
+    
+    # ---- STEP 4: Inject Greeks into the raw chain ----
+    # SimulatedProvider already returns a chain WITH Greeks computed.
+    # Schwab/Yahoo return raw market data (Strike, IV, OI, DTE) without Greeks.
+    # We check for the "GEX" column to avoid redundant double-computation.
+    if "GEX" not in raw_chain.columns:
+        chain_df = market.add_greeks_to_df(raw_chain, spot)  # Vectorized BS computation
+    else:
+        chain_df = raw_chain  # Already has Greeks -- simulation path
+        
+    updated_state = {"spot": spot, "prev_spot": prev_spot}
+    
+    # ---- STEP 5: Expiration filter + strike aggregation ----
+    # Filter to only the selected expiration bucket, or use the full chain.
+    # Aggregate GEX per strike to find the Call Wall (max) and Put Wall (min).
+    if expiration != "ALL":
+        filtered_chain = chain_df[chain_df["Expiration"] == expiration]
+    else:
+        filtered_chain = chain_df
+
+    # Sum all GEX values at each strike to find liquidity walls
+    strike_gex = filtered_chain.groupby("Strike")["GEX"].sum().reset_index()
+
+    # ---- STEP 6: Compute continuous exposure profile and gamma flip ----
+    # This produces both the profile curves AND the 2D heatmap matrices
+    profile_df, flip_price, unique_strikes, gex_mat, vex_mat, cex_mat = market.compute_exposure_profiles(filtered_chain, spot)
+
+    # Identify Call Wall (highest positive GEX) and Put Wall (most negative GEX)
+    if not strike_gex.empty and not strike_gex["GEX"].isna().all():
+        call_wall = strike_gex.loc[strike_gex["GEX"].idxmax()]["Strike"]
+        put_wall = strike_gex.loc[strike_gex["GEX"].idxmin()]["Strike"]
+    else:
+        call_wall, put_wall = 0.0, 0.0
+    
+    # ---- STEP 7: Format metric card values ----
+    spot_str = f"${spot:,.2f}"
+    # Intraday change = current spot vs. close of previous session (current_base)
+    net_day_change = spot - current_base
+    pct_day_change = (net_day_change / current_base) * 100.0
+    change_sign = "+" if net_day_change >= 0 else ""
+    change_color = "text-success" if net_day_change >= 0 else "text-danger"
+    change_str = f"{change_sign}${net_day_change:,.2f} ({change_sign}{pct_day_change:.2f}%)"
+    
+    # 1. Net GEX
+    net_gex_val = strike_gex["GEX"].sum() if not strike_gex.empty else 0.0
+    net_gex_str = format_exposure(net_gex_val)
+    net_gex_class = "text-success" if net_gex_val >= 0 else "text-danger"
+    
+    # 2. Net VEX
+    net_vex_val = filtered_chain["VEX"].sum() if not filtered_chain.empty else 0.0
+    net_vex_str = format_exposure(net_vex_val)
+    net_vex_class = "text-success" if net_vex_val >= 0 else "text-danger"
+    
+    # 3. Net CEX
+    net_cex_val = filtered_chain["CEX"].sum() if not filtered_chain.empty else 0.0
+    net_cex_str = format_exposure(net_cex_val)
+    net_cex_class = "text-success" if net_cex_val >= 0 else "text-danger"
+    
+    # 4. Gamma Flip
+    flip_str = f"${flip_price:,.2f}"
+    dist_to_flip = ((spot - flip_price) / spot) * 100
+    dist_str = f"Spot is {('+' if dist_to_flip >= 0 else '')}{dist_to_flip:.2f}% from Flip"
+    dist_color = "text-success" if dist_to_flip >= 0 else "text-danger"
+    
+    # ---- STEP 8: Determine volatility regime from gamma flip ----
+    # Above the flip: Long Gamma (dealers are stabilizing forces)
+    # Below the flip: Short Gamma (dealers amplify volatility)
+    if spot >= flip_price:
+        regime_label = "LONG GAMMA"
+        regime_class = "text-success"
+        regime_desc = "Dealers support dips / cap rallies. Low volatility."
+    else:
+        regime_label = "SHORT GAMMA"
+        regime_class = "text-danger"
+        regime_desc = "Dealers chase price momentum. Tail-risk volatility high."
+        
+    call_wall_str = f"${call_wall:,.1f}"
+    put_wall_str = f"${put_wall:,.1f}"
+    
+    # ---- STEP 9: Build Chart 1 -- per-strike exposure bar chart ----
+    # User selects GEX, VEX, or CEX via radio buttons. We sum by strike and color:
+    #   Green bars = positive dealer exposure (mean-reverting/stabilizing)
+    #   Red bars   = negative dealer exposure (momentum/destabilizing)
+    strike_greek = filtered_chain.groupby("Strike")[greek_selection].sum().reset_index()
+    colors = ["#10b981" if g >= 0 else "#ef4444" for g in strike_greek[greek_selection]] if not strike_greek.empty else []
+    
+    fig_strikes = go.Figure()
+    if not strike_greek.empty:
+        fig_strikes.add_trace(go.Bar(
+            x=strike_greek["Strike"],
+            y=strike_greek[greek_selection],
+            marker_color=colors,
+            name=f"Net {greek_selection}",
+            hovertemplate="Strike: %{x}<br>Net " + greek_selection + ": $%{y:,.0f}<extra></extra>"
+        ))
+    
+    fig_strikes.add_vline(x=spot, line_width=2, line_color="#3b82f6", annotation_text=f"Spot: ${spot:.2f}", annotation_position="top left", annotation_font_color="#3b82f6")
+    fig_strikes.add_vline(x=flip_price, line_width=1.5, line_dash="dash", line_color="#f59e0b", annotation_text=f"Flip: ${flip_price:.1f}", annotation_position="bottom right", annotation_font_color="#f59e0b")
+    
+    fig_strikes.update_layout(
+        plot_bgcolor="#0d0e12", paper_bgcolor="#181a20",
+        margin=dict(l=20, r=20, t=40, b=20),
+        xaxis=dict(title=dict(text="Options Strike Price", font=dict(color="#8a92a6", size=11)), gridcolor="#242830", tickfont=dict(color="#6c7383")),
+        yaxis=dict(title=dict(text=f"Net Dealer {greek_selection} Exposure ($)", font=dict(color="#8a92a6", size=11)), gridcolor="#242830", zerolinecolor="#3f4756", tickfont=dict(color="#6c7383")),
+        showlegend=False, hovermode="x unified"
+    )
+    
+    # ---- STEP 10: Build Chart 2 -- continuous profile + heatmap ----
+    # TOP PANEL: Line curves of NetGEX/VEX/CEX across a +-10% price range
+    #   - Shows the regime profile and how Greeks evolve with price movement
+    #   - Diamond markers show current exposure values at the actual spot price
+    # BOTTOM PANEL: 2D heatmap of per-strike exposure vs. underlying price
+    #   - Hot/cold colors show where market maker hedging is concentrated
+    #   - The dashed blue vertical line marks the current spot price
+    fig_profile = make_subplots(
+        rows=2, cols=1, 
+        shared_xaxes=True, 
+        vertical_spacing=0.07,
+        row_heights=[0.55, 0.45],
+        subplot_titles=("SYSTEMIC NET EXPOSURE PROFILE", "STRIKE-BY-STRIKE CONCENTRATION HEATMAP")
+    )
+    
+    if not profile_df.empty:
+        # Net GEX Trace (Row 1)
+        fig_profile.add_trace(go.Scatter(
+            x=profile_df["UnderlyingPrice"], y=profile_df["NetGEX"],
+            mode="lines", line=dict(color="#a855f7", width=3), 
+            fill="tozeroy", fillcolor="rgba(168, 85, 247, 0.04)",
+            name="Net GEX", legendgroup="GEX",
+            hovertemplate="Underlying: %{x:,.1f}<br>Net GEX: $%{y:,.0f}<extra></extra>"
+        ), row=1, col=1)
+        
+        # Net VEX Trace (Row 1)
+        fig_profile.add_trace(go.Scatter(
+            x=profile_df["UnderlyingPrice"], y=profile_df["NetVEX"],
+            mode="lines", line=dict(color="#06b6d4", width=3), 
+            fill="tozeroy", fillcolor="rgba(6, 182, 212, 0.04)",
+            name="Net Vanna (VEX)", legendgroup="VEX",
+            hovertemplate="Underlying: %{x:,.1f}<br>Net VEX: $%{y:,.0f}<extra></extra>"
+        ), row=1, col=1)
+        
+        # Net CEX Trace (Row 1)
+        fig_profile.add_trace(go.Scatter(
+            x=profile_df["UnderlyingPrice"], y=profile_df["NetCEX"],
+            mode="lines", line=dict(color="#f97316", width=3), 
+            fill="tozeroy", fillcolor="rgba(249, 115, 22, 0.04)",
+            name="Net Charm (CEX)", legendgroup="CEX",
+            hovertemplate="Underlying: %{x:,.1f}<br>Net CEX: $%{y:,.0f}<extra></extra>"
+        ), row=1, col=1)
+        
+        # Gamma Flip Marker (Row 1)
+        fig_profile.add_trace(go.Scatter(
+            x=[flip_price], y=[0], mode="markers", 
+            marker=dict(color="#f59e0b", size=10, line=dict(color="white", width=2)),
+            name="Gamma Flip", showlegend=False,
+            hovertemplate="Gamma Flip: %{x:,.1f}<extra></extra>"
+        ), row=1, col=1)
+        
+        # Spot GEX Marker (Row 1)
+        active_spot_gex = np.interp(spot, profile_df["UnderlyingPrice"], profile_df["NetGEX"])
+        fig_profile.add_trace(go.Scatter(
+            x=[spot], y=[active_spot_gex], mode="markers", 
+            marker=dict(color="#a855f7", size=10, symbol="diamond", line=dict(color="white", width=1.5)),
+            name="Spot GEX", legendgroup="GEX", showlegend=False,
+            hovertemplate="Spot GEX: $%{y:,.0f}<extra></extra>"
+        ), row=1, col=1)
+        
+        # Spot VEX Marker (Row 1)
+        active_spot_vex = np.interp(spot, profile_df["UnderlyingPrice"], profile_df["NetVEX"])
+        fig_profile.add_trace(go.Scatter(
+            x=[spot], y=[active_spot_vex], mode="markers", 
+            marker=dict(color="#06b6d4", size=10, symbol="diamond", line=dict(color="white", width=1.5)),
+            name="Spot VEX", legendgroup="VEX", showlegend=False,
+            hovertemplate="Spot VEX: $%{y:,.0f}<extra></extra>"
+        ), row=1, col=1)
+        
+        # Spot CEX Marker (Row 1)
+        active_spot_cex = np.interp(spot, profile_df["UnderlyingPrice"], profile_df["NetCEX"])
+        fig_profile.add_trace(go.Scatter(
+            x=[spot], y=[active_spot_cex], mode="markers", 
+            marker=dict(color="#f97316", size=10, symbol="diamond", line=dict(color="white", width=1.5)),
+            name="Spot CEX", legendgroup="CEX", showlegend=False,
+            hovertemplate="Spot CEX: $%{y:,.0f}<extra></extra>"
+        ), row=1, col=1)
+        
+        # Select active Greek matrix for Heatmap
+        if greek_selection == "GEX":
+            heatmap_z = gex_mat
+            z_label = "GEX"
+        elif greek_selection == "VEX":
+            heatmap_z = vex_mat
+            z_label = "VEX"
+        else:
+            heatmap_z = cex_mat
+            z_label = "CEX"
+            
+        # Draw Heatmap (Row 2)
+        if len(unique_strikes) > 0:
+            fig_profile.add_trace(go.Heatmap(
+                x=profile_df["UnderlyingPrice"],
+                y=unique_strikes,
+                z=heatmap_z.T,
+                colorscale="RdBu",
+                zmid=0,
+                showscale=True,
+                colorbar=dict(
+                    title=dict(text=f"Dealer {z_label} ($)", font=dict(color="#8a92a6", size=10)),
+                    tickfont=dict(color="#6c7383", size=8),
+                    thickness=12,
+                    len=0.45,
+                    y=0.22,
+                    yanchor="middle"
+                ),
+                hovertemplate="Asset Price: %{x:,.1f}<br>Strike: %{y:,.1f}<br>" + z_label + ": $%{z:,.0f}<extra></extra>",
+                name=f"{z_label} Heatmap"
+            ), row=2, col=1)
+            
+            # Add a vertical marker line on the Heatmap showing the current spot!
+            fig_profile.add_vline(x=spot, line_width=1.5, line_dash="dash", line_color="#3b82f6", row=2, col=1)
+            
+    fig_profile.update_layout(
+        plot_bgcolor="#0d0e12", paper_bgcolor="#181a20", margin=dict(l=20, r=20, t=50, b=20),
+        showlegend=True, hovermode="closest",
+        legend=dict(
+            font=dict(color="#8a92a6", size=10),
+            bgcolor="rgba(13, 14, 18, 0.7)",
+            bordercolor="#242830",
+            borderwidth=1,
+            x=0.02, y=0.98,
+            xanchor="left", yanchor="top"
+        )
+    )
+    
+    # Update axes styling
+    fig_profile.update_yaxes(title=dict(text="Net Exposure ($)", font=dict(color="#8a92a6", size=11)), gridcolor="#242830", zerolinecolor="#3f4756", tickfont=dict(color="#6c7383"), row=1, col=1)
+    fig_profile.update_yaxes(title=dict(text="Option Strike Prices", font=dict(color="#8a92a6", size=11)), gridcolor="#242830", zerolinecolor="#3f4756", tickfont=dict(color="#6c7383"), row=2, col=1)
+    fig_profile.update_xaxes(title=dict(text="Underlying Asset Value Spectrum", font=dict(color="#8a92a6", size=11)), gridcolor="#242830", tickfont=dict(color="#6c7383"), row=2, col=1)
+    fig_profile.update_xaxes(gridcolor="#242830", row=1, col=1)
+    
+    # Add important vertical markers to both subplots
+    for r in [1, 2]:
+        fig_profile.add_vline(x=spot, line_width=2, line_color="#3b82f6", row=r, col=1)
+        fig_profile.add_vline(x=flip_price, line_width=1.5, line_dash="dash", line_color="#f59e0b", row=r, col=1)
+        if call_wall:
+            fig_profile.add_vline(x=call_wall, line_width=1.5, line_dash="dash", line_color="#ef4444", row=r, col=1)
+        if put_wall:
+            fig_profile.add_vline(x=put_wall, line_width=1.5, line_dash="dash", line_color="#22c55e", row=r, col=1)
+    
+    # Update subplot titles style
+    for annot in fig_profile['layout']['annotations']:
+        annot['font'] = dict(color="#8a92a6", size=11)
+    
+    schwab_badge_text = source_name
+    schwab_badge_class = "badge bg-success ms-auto live-badge-pulse" if source_name == "LIVE SCHWAB DATA" else "badge bg-info ms-auto" if source_name == "YFINANCE DATA" else "badge bg-secondary ms-auto"
+    
+    return (
+        updated_state, spot_str, change_str, change_color,
+        net_gex_str, net_gex_class, net_vex_str, net_vex_class, net_cex_str, net_cex_class,
+        flip_str, dist_str, dist_color, regime_label, regime_class, regime_desc,
+        call_wall_str, flip_str, put_wall_str, fig_strikes, fig_profile,
+        schwab_badge_text, schwab_badge_class
+    )
+
+# ==============================================================================
+# SECTION 6: SCHWAB API DESK CALLBACKS
+# ==============================================================================
+# These callbacks power the credential input panel. They are separate from the
+# main engine callback because they only fire on explicit user button clicks,
+# not on the automatic tick interval.
+#
+# load_initial_credentials : Pre-fills the input boxes from the saved JSON file
+# save_credentials         : Writes the user-entered keys to schwab_tokens.json
+# generate_schwab_auth_link: Builds and displays the clickable OAuth URL
+# connect_schwab_live      : Completes the OAuth handshake (code -> tokens)
+# ==============================================================================
+# SCHWAB INTERACTIVE CALLBACK CONTROLLERS
+# ==============================================================================
+
+@app.callback(
+    [
+        Output("schwab-app-key", "value"),
+        Output("schwab-app-secret", "value"),
+        Output("schwab-redirect-uri", "value")
+    ],
+    [Input("btn-reset", "n_clicks")]
+)
+def load_initial_credentials(n):
+    """
+    Pre-populate the credential input boxes from the saved schwab_tokens.json.
+    Fires once on page load (triggered by btn-reset with n_clicks=None).
+    """
+    tokens = load_schwab_tokens()
+    return tokens.get("app_key", ""), tokens.get("app_secret", ""), tokens.get("redirect_uri", "")
+
+@app.callback(
+    Output("schwab-status-message", "children", allow_duplicate=True),
+    Input("schwab-btn-save-keys", "n_clicks"),
+    [
+        State("schwab-app-key", "value"),
+        State("schwab-app-secret", "value"),
+        State("schwab-redirect-uri", "value")
+    ],
+    prevent_initial_call=True
+)
+def save_credentials(n_clicks, app_key, app_secret, redirect_uri):
+    """
+    Persist the user-entered API credentials to schwab_tokens.json.
+    Strips whitespace from all fields to prevent subtle auth errors.
+    The redirect_uri defaults to https://127.0.0.1 if left blank.
+    """
+    if not n_clicks:
+        return ""
+    tokens = load_schwab_tokens()
+    tokens["app_key"] = app_key.strip() if app_key else ""
+    tokens["app_secret"] = app_secret.strip() if app_secret else ""
+    tokens["redirect_uri"] = redirect_uri.strip() if redirect_uri else "https://127.0.0.1"
+    save_schwab_tokens(tokens)
+    return "Credentials saved successfully to schwab_tokens.json!"
+
+@app.callback(
+    Output("schwab-auth-link-container", "children"),
+    Input("schwab-btn-gen-link", "n_clicks"),
+    [
+        State("schwab-app-key", "value"),
+        State("schwab-redirect-uri", "value")
+    ],
+    prevent_initial_call=True
+)
+def generate_schwab_auth_link(n_clicks, app_key, redirect_uri):
+    """
+    Build the Schwab OAuth authorization URL and render it as a clickable link.
+    The user visits this URL, logs into Schwab, grants access, and is redirected
+    to https://127.0.0.1/?code=XXX which they then paste back into the dashboard.
+    The redirect_uri must be URL-encoded to avoid breaking the query string.
+    """
+    if not n_clicks:
+        return ""
+    if not app_key or "DUMMY" in app_key:
+        return html.Span("Please enter a valid App Key first!", className="text-danger")
+    
+    encoded_redirect = urllib.parse.quote(redirect_uri, safe="")
+    auth_url = f"https://api.schwabapi.com/v1/oauth/authorize?client_id={app_key}&redirect_uri={encoded_redirect}&response_type=code"
+    
+    return html.A("👉 CLICK HERE TO AUTHORIZE WITH SCHWAB 👈", href=auth_url, target="_blank", className="text-warning font-weight-bold")
+
+@app.callback(
+    Output("schwab-status-message", "children"),
+    Input("schwab-btn-connect", "n_clicks"),
+    [
+        State("schwab-auth-code-input", "value"),
+        State("schwab-app-key", "value"),
+        State("schwab-app-secret", "value"),
+        State("schwab-redirect-uri", "value")
+    ],
+    prevent_initial_call=True
+)
+def connect_schwab_live(n_clicks, code, app_key, app_secret, redirect_uri):
+    """
+    Complete the OAuth 2.0 token exchange: convert the authorization code to tokens.
+
+    The 'code' input can be EITHER:
+      - The full redirect URL pasted from the browser address bar
+        (e.g. "https://127.0.0.1/?code=C0abc...")
+      - Just the raw code string itself
+    exchange_schwab_auth_code() handles both cases internally.
+
+    On success, tokens are written to schwab_tokens.json. The main engine
+    callback will automatically detect and use them on the next heartbeat tick.
+    """
+    if not n_clicks:
+        return ""
+    if not code:
+        return "Please paste the redirect URL or code first!"
+        
+    tokens = {
+        "app_key": app_key.strip() if app_key else "",
+        "app_secret": app_secret.strip() if app_secret else "",
+        "redirect_uri": redirect_uri.strip() if redirect_uri else "https://127.0.0.1",
+        "access_token": "",
+        "refresh_token": "",
+        "expires_at": 0,
+        "refresh_expires_at": 0
+    }
+    
+    success, msg = exchange_schwab_auth_code(code.strip(), tokens)
+    if success:
+        return html.Span(msg, className="text-success")
+    else:
+        return html.Span(msg, className="text-danger")
+
+# ==============================================================================
+# SECTION 7: APPLICATION ENTRY POINT
+# ==============================================================================
+if __name__ == "__main__":
+    # debug=True enables:
+    #   - Hot-reload: The server restarts automatically when you save the file
+    #   - Werkzeug debugger: Interactive traceback in the browser on errors
+    # Set debug=False before deploying to any public or production server!
+    app.run(debug=True, port=8050)
